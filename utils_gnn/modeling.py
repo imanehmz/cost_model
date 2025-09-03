@@ -348,3 +348,104 @@ class SimpleGCN(nn.Module):
         out = self.lin(x).squeeze(dim=-1)
         # out has shape [batch_size], one scalar per graph
         return out
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GINConv, GraphNorm, GlobalAttention
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim, dropout=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim, bias=True),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.net(x)
+        return self.drop(x)
+
+class ResidualGIN(nn.Module):
+    """
+    Faster & stabler than your GAT baseline on big batches.
+    - Residual GIN blocks with GraphNorm
+    - JK (max) over layers
+    - GlobalAttention pooling
+    - Output head initialized to predict ~1.0 (good for MAPE on speedups)
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 256,
+        num_layers: int = 5,
+        dropout: float = 0.2,
+        out_channels: int = 1,
+    ):
+        super().__init__()
+        assert num_layers >= 2
+
+        self.input_lin = nn.Linear(in_channels, hidden_channels, bias=True)
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(num_layers):
+            # Two-layer MLP inside GIN
+            mlp = MLP(hidden_channels, hidden_channels, hidden_channels, dropout=dropout)
+            self.convs.append(GINConv(mlp, train_eps=True))
+            self.norms.append(GraphNorm(hidden_channels))
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Global attention pooling with a small gate MLP
+        self.gate_nn = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels // 2, 1),
+        )
+        self.pool = GlobalAttention(self.gate_nn)
+
+        # Prediction head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, out_channels),
+        )
+
+        # Initialize final layer to predict ~1.0 at start (important for MAPE)
+        nn.init.zeros_(self.head[-1].weight)
+        with torch.no_grad():
+            self.head[-1].bias.fill_(1.0)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        x = self.input_lin(x)
+
+        # Residual GIN stack + GraphNorm
+        xs = []
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(x, edge_index)
+            h = norm(h, batch)
+            h = F.relu(h, inplace=True)
+            h = self.dropout(h)
+            # Residual
+            x = x + h
+            xs.append(x)
+
+        # JK (max) over layers
+        h_all = torch.stack(xs, dim=0)           # [L, N, C]
+        x = torch.amax(h_all, dim=0)             # [N, C]
+
+        # Global pooling
+        g = self.pool(x, batch)                   # [B, C]
+
+        # Head (bias ~ 1.0 => sane start for MAPE)
+        out = self.head(g).squeeze(-1)            # [B]
+        return out

@@ -47,9 +47,21 @@ def train_gnn_model(
     dataloader_size = {}
     for phase in ["train", "val"]:
         total_samples = 0
-        for data_batch in dataloader_dict[phase]:
-            total_samples += data_batch.num_graphs  # num_graphs is how many graphs in the batch
+        for batch in dataloader_dict[phase]:
+            if isinstance(batch, (list, tuple)):
+                data_batch = batch[0]          # (DataBatch, attrs)
+            else:
+                data_batch = batch              # DataBatch
+            total_samples += data_batch.num_graphs
         dataloader_size[phase] = total_samples
+    # if initial execution time uncomment this
+    # for phase in ["train", "val"]:
+    #     total_samples = 0
+    #     for data_batch, attr_batch in dataloader_dict[phase]:
+    #         print("data batch", data_batch)
+    #         total_samples += data_batch.num_graphs  # now works as expected
+    #     dataloader_size[phase] = total_samples
+
     
     # OneCycleLR if you want to step once per mini-batch
     steps_per_epoch = len(dataloader_dict["train"])
@@ -79,7 +91,7 @@ def train_gnn_model(
             
             pbar = tqdm(dataloader_dict[phase], desc=f"{phase} Epoch {epoch+1}")
             
-            for batch in pbar:
+            for batch, _ in pbar:
                 batch = batch.to(device)
                 
                 labels = batch.y  # shape [batch_size]
@@ -156,3 +168,8 @@ def train_gnn_model(
     logger.info(f"Training done in {total_time//60:.0f}m {total_time%60:.0f}s, best val loss: {best_loss:.4f}")
     
     return best_loss, best_model
+from torch_geometric.data import Batch
+
+def collate_with_attrs(batch):
+    data_list, attr_list = zip(*batch)  # separate (Data, attrs) tuples
+    return Batch.from_data_list(data_list), attr_list

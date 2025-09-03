@@ -11,8 +11,16 @@ from torch_geometric.loader import DataLoader
 
 from utils_gnn.train_utils import train_gnn_model, mape_criterion
 from utils_gnn.data_utils import GNNDatasetParallel  
-from utils_gnn.modeling import SimpleGCN, SimpleGAT
+from utils_gnn.modeling import SimpleGCN, SimpleGAT, ResidualGIN
+from torch_geometric.data import Batch
 
+def collate_with_attrs(batch):
+    """
+    Custom collate function for batching GNN data and accompanying attributes.
+    """
+    data_list, attr_list = zip(*batch)
+    batched_data = Batch.from_data_list(data_list)
+    return batched_data, list(attr_list)
 @hydra.main(config_path="conf", config_name="config-gnn")
 def main(conf):
     log_folder_path = os.path.join(conf.experiment.base_path, "logs/")
@@ -30,7 +38,7 @@ def main(conf):
     # Setup wandb
     if conf.wandb.use_wandb:
         import wandb
-        wandb.init(name=conf.experiment.name, project=conf.wandb.project)
+        wandb.init(name=f"{conf.experiment.name}_{conf.model.name}", project=conf.wandb.project)
         wandb.config = dict(conf)
     
     # Decide on device
@@ -42,35 +50,37 @@ def main(conf):
         dataset_filename=conf.data_generation.train_dataset_file,
         pkl_output_folder="gnn_pickles/train",
         nb_processes=4,
-        device="cpu",
-        just_load_pickled=False
+        device="cuda:1",
+        just_load_pickled=True
     )
 
     gnn_dataset_val = GNNDatasetParallel(
         dataset_filename=conf.data_generation.valid_dataset_file,
         pkl_output_folder="gnn_pickles/val",
         nb_processes=4,
-        device="cpu",
-        just_load_pickled=False
+        device="cuda:1",
+        just_load_pickled=True
     )
 
 
     # --- 2) Make PyG DataLoaders ---
     train_loader = DataLoader(
-        gnn_dataset_train.data_list, 
+        gnn_dataset_train, 
         batch_size=conf.data_generation.batch_size, 
-        shuffle=True
+        shuffle=True,
+        collate_fn=collate_with_attrs,
     )
     val_loader = DataLoader(
-        gnn_dataset_val.data_list,
+        gnn_dataset_val,
         batch_size=conf.data_generation.batch_size,
-        shuffle=False
+        shuffle=False,
+        collate_fn=collate_with_attrs,
     )
     dataloaders = {"train": train_loader, "val": val_loader}
 
-    model = SimpleGAT(
-        in_channels=conf.model.input_size,       # e.g. 32 or 64
-        hidden_channels=conf.model.hidden_size,  # from config
+    model = ResidualGIN(
+        in_channels=conf.model.input_size,       
+        hidden_channels=conf.model.hidden_size,  
         out_channels=1
     )
 
